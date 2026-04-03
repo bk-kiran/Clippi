@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -17,6 +18,8 @@
         "width": 480,
         "height": 600,
         "visible": false,
+        "focus": true,
+        "skipTaskbar": true,
         "decorations": false,
         "alwaysOnTop": true,
         "resizable": false

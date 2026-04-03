@@ -1,11 +1,20 @@
 use arboard::Clipboard;
-use std::{thread, time::Duration};
+use std::{
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    thread,
+    time::Duration,
+};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Emitter, Manager,
+    Emitter, Manager, State,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+#[tauri::command]
+fn set_internal_write(flag: State<Arc<AtomicBool>>) {
+    flag.store(true, Ordering::Relaxed);
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -14,6 +23,12 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .setup(|app| {
+            // Run as an accessory (overlay) app: no Dock icon, no Cmd+Tab entry.
+            // This also stops macOS from fighting the app when it tries to activate
+            // from a global shortcut fired while another app is in the foreground.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             // Register platform-specific global shortcut to show/hide the window
             #[cfg(target_os = "macos")]
             let shortcut = "Cmd+Shift+V";
@@ -24,18 +39,22 @@ pub fn run() {
                 .on_shortcut(shortcut, |app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
+                            let visible = window.is_visible().unwrap_or(false);
+                            let focused = window.is_focused().unwrap_or(false);
+
+                            // Only dismiss if the window is already in front and active.
+                            // Any other state (hidden, visible-but-unfocused) should show it.
+                            if visible && focused {
                                 let _ = window.hide();
                             } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                                // app.show() activates the application process itself
+                                // at the macOS level — required under accessory policy
+                                // so the window actually comes forward interactively.
                                 #[cfg(target_os = "macos")]
-                                unsafe {
-                                    use objc::{class, msg_send, sel, sel_impl, runtime::Object};
-                                    let cls = class!(NSApplication);
-                                    let ns_app: *mut Object = msg_send![cls, sharedApplication];
-                                    let _: () = msg_send![ns_app, activateIgnoringOtherApps: objc::runtime::YES];
-                                }
+                                app.show().unwrap();
+                                window.show().unwrap();
+                                window.set_always_on_top(true).unwrap();
+                                window.set_focus().unwrap();
                             }
                         }
                     }
@@ -51,6 +70,11 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .build(app)?;
+
+            // Shared flag: frontend sets this before writing to clipboard so the
+            // polling thread knows to skip the next change (it was Clippi's own write).
+            let internal_write = Arc::new(AtomicBool::new(false));
+            app.manage(Arc::clone(&internal_write));
 
             // Clipboard polling thread — emits "clip-captured" on new text
             let clip_handle = app.handle().clone();
@@ -68,6 +92,10 @@ pub fn run() {
                     match clipboard.get_text() {
                         Ok(text) if !text.is_empty() && text != last => {
                             last = text.clone();
+                            // If the frontend just wrote this, clear the flag and skip.
+                            if internal_write.swap(false, Ordering::Relaxed) {
+                                continue;
+                            }
                             let _ = clip_handle.emit("clip-captured", text);
                         }
                         _ => {}
@@ -90,7 +118,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![])
+        .invoke_handler(tauri::generate_handler![set_internal_write])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
